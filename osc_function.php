@@ -5,6 +5,9 @@
  * These are required by the outputSACN function.
  */
 
+// Define the file path for storing DMX levels
+const DMX_LEVELS_FILE = 'dmx_levels.json';
+
 /**
  * Pads a string with null bytes to the next 4-byte boundary.
  * OSC strings must be null-terminated and padded to multiples of 4 bytes.
@@ -83,17 +86,62 @@ function sendOscDmxMessage($socket, string $ip, int $port, string $address, stri
 }
 
 /**
+ * Loads DMX levels from the persistence file.
+ *
+ * @return array An associative array of DMX levels, e.g., ['universe_id' => ['channel_id' => level]].
+ */
+function loadDmxLevels(): array {
+    if (!file_exists(DMX_LEVELS_FILE)) {
+        return [];
+    }
+    $contents = file_get_contents(DMX_LEVELS_FILE);
+    if ($contents === false) {
+        error_log("Error reading DMX levels file: " . DMX_LEVELS_FILE);
+        return [];
+    }
+    $levels = json_decode($contents, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        error_log("Error decoding JSON from DMX levels file: " . json_last_error_msg());
+        // Attempt to back up corrupted file and return empty array
+        rename(DMX_LEVELS_FILE, DMX_LEVELS_FILE . '.bak.' . time());
+        return [];
+    }
+    return is_array($levels) ? $levels : [];
+}
+
+/**
+ * Saves DMX levels to the persistence file.
+ *
+ * @param array $levels The associative array of DMX levels to save.
+ * @return bool True on success, false on failure.
+ */
+function saveDmxLevels(array $levels): bool {
+    $json = json_encode($levels, JSON_PRETTY_PRINT);
+    if ($json === false) {
+        error_log("Error encoding DMX levels to JSON: " . json_last_error_msg());
+        return false;
+    }
+    // Use file_put_contents with FILE_LOCK to prevent race conditions during write
+    if (file_put_contents(DMX_LEVELS_FILE, $json, LOCK_EX) === false) {
+        error_log("Error writing DMX levels to file: " . DMX_LEVELS_FILE);
+        return false;
+    }
+    return true;
+}
+
+
+/**
  * Sends an OSC DMX level message to an Open Lighting Architecture (OLA) receiver
- * with optional linear fading between two levels.
+ * with optional linear fading between two levels. It also persists the last set level,
+ * automatically determining the starting level from memory or defaulting to 0.
  *
  * @param int $universe The DMX Universe number (e.g., 0, 1, 2...).
  * @param int $channel The DMX Channel number (1-512).
- * @param int $fromLevel The starting DMX level (0-255).
  * @param int $toLevel The target DMX level (0-255).
  * @param float $fadeDuration The duration of the fade in seconds (0 for immediate).
  * @return bool True if the message(s) were sent successfully, false otherwise.
  */
-function outputSACN(int $universe, int $channel, int $fromLevel, int $toLevel, float $fadeDuration): bool {
+function outputSACN(int $universe, int $channel, int $toLevel, float $fadeDuration): bool {
     // --- Configuration (can be made parameters if more flexibility is needed) ---
     $targetIp = '192.168.251.128'; // The IP address of the OSC receiver (OLA)
     $targetPort = 7770;            // The port number for the OSC receiver
@@ -106,10 +154,6 @@ function outputSACN(int $universe, int $channel, int $fromLevel, int $toLevel, f
     }
     if ($channel < 1 || $channel > 512) {
         error_log("Error: DMX Channel must be between 1 and 512. Provided: {$channel}");
-        return false;
-    }
-    if ($fromLevel < 0 || $fromLevel > 255) {
-        error_log("Error: 'From' DMX Level must be between 0 and 255. Provided: {$fromLevel}");
         return false;
     }
     if ($toLevel < 0 || $toLevel > 255) {
@@ -135,6 +179,14 @@ function outputSACN(int $universe, int $channel, int $fromLevel, int $toLevel, f
 
     $success = true; // Assume success initially
 
+    // Load current levels for persistent state management
+    $dmxLevels = loadDmxLevels();
+
+    // Determine the actual starting level from remembered state or default to 0
+    // Ensure the universe and channel arrays exist before attempting to access
+    $actualFromLevel = $dmxLevels[$universe][$channel] ?? 0;
+    echo "Using remembered level for U{$universe}C{$channel}: {$actualFromLevel}\n";
+
     if ($fadeDuration === 0.0) {
         // If fade duration is 0, immediately set the target level (toLevel)
         echo "Setting DMX Universe: {$universe}, Channel: {$channel} to {$toLevel} immediately...\n";
@@ -149,12 +201,12 @@ function outputSACN(int $universe, int $channel, int $fromLevel, int $toLevel, f
         $numSteps = 100; // Number of messages to send during the fade for smoothness
         $timePerStep = $fadeDuration / $numSteps; // Time in seconds per step
         // Calculate level change per step. Use $numSteps-1 for accurate last step value if numSteps > 1
-        $levelChangePerStep = ($toLevel - $fromLevel) / ($numSteps > 1 ? $numSteps - 1 : 1);
+        $levelChangePerStep = ($toLevel - $actualFromLevel) / ($numSteps > 1 ? $numSteps - 1 : 1);
 
-        echo "Fading DMX Universe: {$universe}, Channel: {$channel} from {$fromLevel} to {$toLevel} over {$fadeDuration} seconds...\n";
+        echo "Fading DMX Universe: {$universe}, Channel: {$channel} from {$actualFromLevel} to {$toLevel} over {$fadeDuration} seconds...\n";
 
         for ($i = 0; $i < $numSteps; $i++) {
-            $currentLevel = round($fromLevel + ($levelChangePerStep * $i));
+            $currentLevel = round($actualFromLevel + ($levelChangePerStep * $i));
 
             // Clamp level to 0-255 just in case of floating point inaccuracies
             $currentLevel = max(0, min(255, $currentLevel));
@@ -181,6 +233,17 @@ function outputSACN(int $universe, int $channel, int $fromLevel, int $toLevel, f
         }
 
         echo "Fade complete for DMX Universe: {$universe}, Channel: {$channel}. Final level: {$toLevel}.\n";
+    }
+
+    // --- Update and Save the last level ---
+    // Ensure the universe array exists before trying to set the channel level
+    if (!isset($dmxLevels[$universe])) {
+        $dmxLevels[$universe] = [];
+    }
+    $dmxLevels[$universe][$channel] = $toLevel; // Store the final 'to' level
+    if (!saveDmxLevels($dmxLevels)) {
+        $success = false;
+        error_log("Failed to save DMX levels after operation for U{$universe}C{$channel}.");
     }
 
     // --- Close the socket ---
